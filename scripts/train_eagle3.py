@@ -890,7 +890,6 @@ def main():
                 data,
                 target_model,
                 is_online,
-                debug_step=global_step - 1,
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 

@@ -474,11 +474,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         This operation is virtually instant and consumes negligible RAM
         because no data is actually read from disk yet.
         """
-        return torch.load(
-            self.datapaths[index],
-            weights_only=False,
-            mmap=True  # 关键：开启内存映射
-        )
+        return torch.load(self.datapaths[index], weights_only=False, mmap=True)
 
     @staticmethod
     def process_data(data, max_len, transform=None, sp_rank=0, sp_size=1):
@@ -567,7 +563,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         new_data["loss_mask"] = full_loss_mask.contiguous()
 
         # Generate Attention Mask (Full Length)
-        new_data["attention_mask"] = torch.ones_like(new_data["loss_mask"], dtype=torch.long)
+        new_data["attention_mask"] = torch.ones_like(
+            new_data["loss_mask"], dtype=torch.long
+        )
 
         if transform:
             new_data = transform(new_data)
@@ -589,7 +587,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
             self.max_len,
             self.transform,
             sp_rank=self.sp_rank,
-            sp_size=self.sp_size
+            sp_size=self.sp_size,
         )
 
     def __len__(self):
@@ -600,8 +598,7 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
 
 def build_offline_eagle3_dataset(
-    hidden_states_path: str,
-    max_len: int = 2048
+    hidden_states_path: str, max_len: int = 2048
 ) -> torch.utils.data.Dataset:
 
     return OfflineEagle3Dataset(
