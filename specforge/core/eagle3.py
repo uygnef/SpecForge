@@ -23,6 +23,7 @@
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
@@ -31,6 +32,7 @@ from yunchang import EXTRACT_FUNC_DICT
 from specforge.core.loss import LogSoftmaxLoss
 from specforge.distributed import (
     gather_outputs_and_unpad,
+    get_draft_sp_group,
     get_sp_ring_group,
     get_sp_ulysses_group,
 )
@@ -234,21 +236,50 @@ class OnlineEagle3Model(Eagle3Model):
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
-            logits = gather_outputs_and_unpad(logits, gather_dim=1)
-            # Step 5.5: record metrics first as we in-place modify logits
-            with torch.no_grad():
-                acces.append(
-                    _compute_metric_acc(
-                        logits=logits,
-                        target_p=target_p,
-                        position_mask=position_mask,
-                        loss_mask=loss_mask,
-                    )
-                )
+            if self.attention_backend == "usp":
+                target_p_local = self.prepare_usp_input(target_p)
+                position_mask_local = self.prepare_usp_input(position_mask)
+                loss_mask_local = self.prepare_usp_input(loss_mask)
+                sp_group = get_draft_sp_group()
+                sp_world_size = self.sp_world_size
 
-            # Step 5.6: calculate loss, in-place modifies logits!
-            loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
-            plosses.append(loss)
+                # Step 5.5: record metrics first as we in-place modify logits
+                with torch.no_grad():
+                    local_correct = (
+                        (logits.argmax(-1) == target_p_local.argmax(-1))
+                        * position_mask_local.squeeze(-1)
+                    ).sum()
+                    local_loss_mask_sum = loss_mask_local.sum()
+                    if sp_world_size > 1:
+                        dist.all_reduce(local_correct, group=sp_group)
+                        dist.all_reduce(local_loss_mask_sum, group=sp_group)
+                    acces.append(
+                        local_correct / local_loss_mask_sum.clamp_min(1e-6)
+                    )
+
+                # Step 5.6: calculate loss, in-place modifies logits!
+                loss = LogSoftmaxLoss.apply(
+                    logits, target_p_local, position_mask_local
+                )
+                if sp_world_size > 1:
+                    dist.all_reduce(loss, group=sp_group)
+                    loss = loss / sp_world_size
+                plosses.append(loss)
+            else:
+                # Step 5.5: record metrics first as we in-place modify logits
+                with torch.no_grad():
+                    acces.append(
+                        _compute_metric_acc(
+                            logits=logits,
+                            target_p=target_p,
+                            position_mask=position_mask,
+                            loss_mask=loss_mask,
+                        )
+                    )
+
+                # Step 5.6: calculate loss, in-place modifies logits!
+                loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+                plosses.append(loss)
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask

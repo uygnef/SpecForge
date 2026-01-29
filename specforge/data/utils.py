@@ -121,7 +121,6 @@ class DataCollatorWithPadding:
                 batch["hidden_state"] = torch.cat(
                     [item["hidden_state"] for item in features]
                 )
-                batch["target"] = torch.cat([item["target"] for item in features])
             else:
                 batch["hidden_state"] = torch.cat(
                     [
@@ -129,12 +128,9 @@ class DataCollatorWithPadding:
                         for item in features
                     ]
                 )
-                batch["target"] = torch.cat(
-                    [
-                        self.paddingtensor(item["target"], max_length)
-                        for item in features
-                    ]
-                )
+            batch["target"] = torch.cat(
+                [self.paddingtensor(item["target"], max_length) for item in features]
+            )
         return batch
 
 
