@@ -106,6 +106,15 @@ class DataCollatorWithPadding:
         batch_loss_mask = torch.cat(
             [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
         )
+        if "position_ids" in features[0]:
+            batch_position_ids = torch.cat(
+                [
+                    self.paddingtensor2D(item["position_ids"], max_length)
+                    for item in features
+                ]
+            )
+        else:
+            batch_position_ids = None
         batch = {
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
@@ -113,6 +122,8 @@ class DataCollatorWithPadding:
             "hidden_state": None,
             "target": None,
         }
+        if batch_position_ids is not None:
+            batch["position_ids"] = batch_position_ids
         if all("hidden_state" in item for item in features):
             assert all(
                 "target" in item for item in features

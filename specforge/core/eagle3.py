@@ -24,6 +24,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
@@ -127,7 +128,13 @@ class OnlineEagle3Model(Eagle3Model):
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
-        global_seq_length = input_ids.shape[1]
+        if self.attention_backend == "usp":
+            if seq_length <= self.length:
+                raise ValueError(
+                    f"USP local seq_length ({seq_length}) must be larger than "
+                    f"ttt_length ({self.length})"
+                )
+            usp_chunk_size = seq_length - self.length
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
@@ -149,18 +156,9 @@ class OnlineEagle3Model(Eagle3Model):
             else:
                 device = hidden_states.device
                 if self.attention_backend == "usp":
-                    global_len = input_ids.shape[1]
-                    sp_world_size = self.sp_world_size
-                    sp_rank = self.sp_rank
-                    chunk_size = (global_len + sp_world_size - 1) // sp_world_size
-                    start = sp_rank * chunk_size + past_key_values_length
                     position_ids = torch.arange(
-                        start,
-                        start + chunk_size,
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    position_ids = position_ids.unsqueeze(0)
+                        0, seq_length, dtype=torch.long, device=device
+                    ).unsqueeze(0)
                 else:
                     position_ids = torch.arange(
                         past_key_values_length,
@@ -170,7 +168,21 @@ class OnlineEagle3Model(Eagle3Model):
                     )
                     position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            position_ids = position_ids.long()
+            if self.attention_backend == "usp":
+                if position_ids.dim() != 2:
+                    position_ids = position_ids.view(-1, position_ids.shape[-1])
+                if position_ids.size(1) > seq_length:
+                    position_ids = position_ids[:, :seq_length]
+                elif position_ids.size(1) < seq_length:
+                    pad_len = seq_length - position_ids.size(1)
+                    last = position_ids[:, -1:]
+                    pad = last + torch.arange(
+                        1, pad_len + 1, device=position_ids.device
+                    ).unsqueeze(0)
+                    position_ids = torch.cat([position_ids, pad], dim=1)
+            else:
+                position_ids = position_ids.view(-1, seq_length)
 
         # Step 4: handle attention mask
         if attention_mask is None:
@@ -205,14 +217,20 @@ class OnlineEagle3Model(Eagle3Model):
 
         for idx in range(self.length):
             if self.attention_backend == "usp":
-                target_slice_len = global_seq_length
+                target_slice_len = usp_chunk_size
             else:
                 target_slice_len = seq_length
             target_p = target_p_padded[:, idx : idx + target_slice_len, :]
             if self.attention_backend == "usp":
-                input_ids = self.prepare_usp_input(global_input_ids)
+                input_ids = global_input_ids[:, :usp_chunk_size]
+                hidden_states_step = hidden_states[:, :usp_chunk_size, :]
+                position_ids_step = position_ids[:, :usp_chunk_size]
+                attention_mask_step = attention_mask[:, :usp_chunk_size]
             else:
                 input_ids = global_input_ids
+                hidden_states_step = hidden_states
+                position_ids_step = position_ids
+                attention_mask_step = attention_mask
 
             is_last = idx == self.length - 1
 
@@ -223,10 +241,10 @@ class OnlineEagle3Model(Eagle3Model):
             # Step 5.2: run the draft model backbone
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
-                hidden_states=hidden_states,
+                hidden_states=hidden_states_step,
                 cache_hidden=cache_hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
+                attention_mask=attention_mask_step,
+                position_ids=position_ids_step,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
@@ -237,9 +255,9 @@ class OnlineEagle3Model(Eagle3Model):
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)
             if self.attention_backend == "usp":
-                target_p_local = self.prepare_usp_input(target_p)
-                position_mask_local = self.prepare_usp_input(position_mask)
-                loss_mask_local = self.prepare_usp_input(loss_mask)
+                target_p_local = target_p
+                position_mask_local = position_mask[:, :usp_chunk_size, :]
+                loss_mask_local = loss_mask[:, :usp_chunk_size, :]
                 sp_group = get_draft_sp_group()
                 sp_world_size = self.sp_world_size
 
@@ -251,8 +269,12 @@ class OnlineEagle3Model(Eagle3Model):
                     ).sum()
                     local_loss_mask_sum = loss_mask_local.sum()
                     if sp_world_size > 1:
-                        dist.all_reduce(local_correct, group=sp_group)
-                        dist.all_reduce(local_loss_mask_sum, group=sp_group)
+                        local_correct = dist_nn.all_reduce(
+                            local_correct, op=dist.ReduceOp.SUM, group=sp_group
+                        )
+                        local_loss_mask_sum = dist_nn.all_reduce(
+                            local_loss_mask_sum, op=dist.ReduceOp.SUM, group=sp_group
+                        )
                     acces.append(
                         local_correct / local_loss_mask_sum.clamp_min(1e-6)
                     )
@@ -262,7 +284,9 @@ class OnlineEagle3Model(Eagle3Model):
                     logits, target_p_local, position_mask_local
                 )
                 if sp_world_size > 1:
-                    dist.all_reduce(loss, group=sp_group)
+                    loss = dist_nn.all_reduce(
+                        loss, op=dist.ReduceOp.SUM, group=sp_group
+                    )
                     loss = loss / sp_world_size
                 plosses.append(loss)
             else:

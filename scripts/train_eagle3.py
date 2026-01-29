@@ -453,6 +453,8 @@ def build_dataloaders(
             train_eagle3_dataset = build_offline_eagle3_dataset(
                 args.train_hidden_states_path,
                 args.max_length,
+                ttt_length=args.ttt_length,
+                use_usp_preprocess=(args.attention_backend == "usp"),
             )
 
     train_dataloader = prepare_dp_dataloaders(
@@ -485,6 +487,8 @@ def build_dataloaders(
             eval_eagle3_dataset = build_offline_eagle3_dataset(
                 args.eval_hidden_states_path,
                 args.max_length,
+                ttt_length=args.ttt_length,
+                use_usp_preprocess=(args.attention_backend == "usp"),
             )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
@@ -614,6 +618,9 @@ def run_forward(
             loss_mask=loss_mask,
             target=target,
             hidden_states=hidden_states,
+            position_ids=(
+                data["position_ids"].cuda() if "position_ids" in data else None
+            ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
         )
